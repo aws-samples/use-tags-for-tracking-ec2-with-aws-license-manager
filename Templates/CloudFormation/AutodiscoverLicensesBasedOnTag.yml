@@ -1,0 +1,426 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description:
+  AWS CloudFormation template to associate and dissociate ec2 instances with Self-managed license in AWS License Manager based on tags using EventBridge, IAM
+  and AWS Lambda.
+Parameters:
+  EventBridgeRuleScheduleToAdd:
+    Type: String
+    Description: >-
+      Cron or rate expression to use for the EventBridge rule, this will determine the frequency of running the Lambda function to add EC2 instances with matching tags to AWS License Manager. For example: cron(0 0 ? * SUN *) or rate(7 days). Important: The time zone used is UTC. For more information, see https://docs.aws.amazon.com/eventbridge/latest/userguide/scheduled-events.html.
+    Default: "cron(0 0 ? * SUN *)"
+  EventBridgeRuleScheduleToRemove:
+    Type: String
+    Description: >-
+      Cron or rate expression to use for the EventBridge rule, this will determine the frequency of running the Lambda function to remove EC2 instances with mismatching tags from AWS License Manager. For example: cron(0 1 ? * SUN *) or rate(7 days). Important: The time zone used is UTC. For more information, see https://docs.aws.amazon.com/eventbridge/latest/userguide/scheduled-events.html.
+    Default: "cron(0 1 ? * SUN *)"
+  AWSAccountId:
+    Type: String
+    Description: >-
+      The AWS account ID of the Self-managed license. For organization setup, use AWS License Manager delegate account.
+    Default: "123456789012"
+    MaxLength: 12
+    MinLength: 12
+  TagKey:
+    Type: String
+    Description: >-
+      The tag key reference that assigned to the EC2 instances and Self-managed licenses.
+    Default: "PO"
+Resources:
+  AddLicenseManagerEventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub "EventBridge rule created to trigger the ${AddLicenseManagerLambdaFunction} lambda function. Created by CloudFormation stack name: ${AWS::StackName}"
+      ScheduleExpression:
+        Ref: EventBridgeRuleScheduleToAdd
+      State: ENABLED
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+              - AddLicenseManagerLambdaFunction
+              - Arn
+          Id: LicenseManagerTagBaseBlog
+  RemoveLicenseManagerEventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub "EventBridge rule created to trigger the ${RemoveLicenseManagerLambdaFunction} lambda function. Created by CloudFormation stack name: ${AWS::StackName}"
+      ScheduleExpression:
+        Ref: EventBridgeRuleScheduleToRemove
+      State: ENABLED
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+              - RemoveLicenseManagerLambdaFunction
+              - Arn
+          Id: LicenseManagerTagBaseBlog
+  PermissionForEventsToInvokeLambdaToAdd:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: AddLicenseManagerLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::GetAtt:
+          - AddLicenseManagerEventBridgeRule
+          - Arn
+  PermissionForEventsToInvokeLambdaToRemove:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: RemoveLicenseManagerLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::GetAtt:
+          - RemoveLicenseManagerEventBridgeRule
+          - Arn
+  LicenseManagerTagBasedAWSLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AWSLambdaLicenseManagerTagBaseBlogPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - ec2:DescribeTags
+                  - ec2:DescribeInstances
+                  - license-manager:ListLicenseConfigurations
+                  - license-manager:ListLicenseSpecificationsForResource
+                Resource:
+                  - "*"
+                Effect: Allow
+              - Action:
+                  - license-manager:UpdateLicenseSpecificationsForResource
+                  - license-manager:GetLicenseConfiguration
+                  - license-manager:ListUsageForLicenseConfiguration
+                Resource:
+                  - !Sub arn:${AWS::Partition}:license-manager:${AWS::Region}:${AWS::AccountId}:license-configuration:*
+                  - !Sub arn:${AWS::Partition}:license-manager:${AWS::Region}:${AWSAccountId}:license-configuration:*
+                Effect: Allow
+              - Action: logs:CreateLogGroup
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+                Effect: Allow
+              - Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-AddLicenseManagerLambdaFunction-*:*
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-RemoveLicenseManagerLambdaFunction-*:*
+                Effect: Allow
+      Tags:
+        - Key: cloudformation:logical-id
+          Value: LicenseManagerTagBasedAWSLambdaRole
+        - Key: cloudformation:stack-id
+          Value: !Ref AWS::StackId
+        - Key: cloudformation:stack-name
+          Value: !Ref AWS::StackName
+  AddLicenseManagerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: !Sub "Lambda function to link the EC2 instance to a License Manager configuration based on tags. Created by CloudFormation stack name: ${AWS::StackName}"
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          default_region = os.environ['RegionId']
+          default_account = os.environ['AccountId']
+          ResourceTargetTagKey = os.environ['TargetTagKey']
+          LMAccountID = os.environ['CentralAWSAccountID']
+
+          def get_license_configuration(LicenseConfigurationArn):
+              lm_client = get_lm_client(default_region)
+              response = lm_client.get_license_configuration(
+                  LicenseConfigurationArn = LicenseConfigurationArn,
+              )
+              return response
+
+          # sample function to update license specifications for all ec2 instances based on tags
+          def update_license_specifications_for_all_ec2_tagged_instances():
+              lm_client = get_lm_client(default_region)
+              ec2_client = get_ec2_client(default_region)
+
+              response = ec2_client.describe_instances(
+                      Filters=[
+                          {
+                              'Name': 'tag-key',
+                              'Values': [
+                                      ResourceTargetTagKey
+                                  ]
+                          },
+                          {
+                              'Name': 'instance-state-name',
+                              'Values': [
+                                      'running'
+                                  ]
+                          }
+                      ]
+                  )
+              print('Tag key:',ResourceTargetTagKey)
+              while True:
+                  if "Reservations" in response:
+                      for reservation in response["Reservations"]:
+                          for instance in reservation["Instances"]:
+                              print('------------------New Instance------------------------')
+                              print('Instance with matching tag key:',instance['InstanceId'])
+                              resource_arn = "arn:aws:ec2:{}:{}:instance/{}".format(default_region, default_account, instance['InstanceId'])
+                              print('Instance ARN:',resource_arn)
+                              TagsOutput = ec2_client.describe_tags(
+                                  Filters=[
+                                      {
+                                          'Name': 'resource-id',
+                                          'Values': [
+                                              instance['InstanceId']
+                                          ]
+                                      },
+                                      {
+                                          'Name': 'key',
+                                          'Values': [
+                                              ResourceTargetTagKey
+                                          ]
+                                      }
+                                  ]
+                              )
+                              print('Instance tags:',TagsOutput['Tags'])
+                              print('Instance tenancy:',instance['Placement']['Tenancy'])
+                              if (instance['Placement']['Tenancy'] == 'default' or instance['Placement']['Tenancy'] == 'dedicated'):
+                                selfmanagedlicenses = lm_client.list_license_configurations(
+                                  Filters=[
+                                      {
+                                          'Name': 'licenseCountingType',
+                                          'Values': [
+                                              'Instance',
+                                              'vCPU'
+                                          ]
+                                      }
+                                  ]
+                                )
+                              else:
+                                selfmanagedlicenses = lm_client.list_license_configurations()
+                              for idx, LicenseConfigurations in enumerate(selfmanagedlicenses['LicenseConfigurations']):
+                                  print('Self-managed license ARN:', LicenseConfigurations['LicenseConfigurationArn'])
+                                  print('Self-managed license Name:', LicenseConfigurations['Name'])
+                                  LCrecource = lm_client.list_usage_for_license_configuration(
+                                      LicenseConfigurationArn=LicenseConfigurations['LicenseConfigurationArn'],
+                                      Filters=[
+                                            {
+                                                'Name': 'resourceArn',
+                                                'Values': [
+                                                    'resource_arn',
+                                                ]
+                                            },
+                                        ]
+                                  print('License configuration with instance ARN as a filter:', LCrecource)
+                                  if (LCrecource['LicenseConfigurationUsageList']):
+                                      print('Skipping...The instance is part of the self-managed license')
+                                      continue
+                                  else:
+                                    getlicenseconfig = get_license_configuration(LicenseConfigurations['LicenseConfigurationArn'])
+                                    if ('Tags' in getlicenseconfig):
+                                        print('Self-managed license tags:', getlicenseconfig['Tags'])
+                                        for LCtag in getlicenseconfig['Tags']:
+                                            if LCtag['Key'] == ResourceTargetTagKey:
+                                                if LCtag['Value'] == TagsOutput['Tags'][0]['Value']:
+                                                    print('ResourceARN:',resource_arn)
+                                                    print ('Adding...EC2 Instance to Self-managed license with matching tags:', instance['InstanceId'])
+                                                    lm_client.update_license_specifications_for_resource(
+                                                        ResourceArn = resource_arn,
+                                                        AddLicenseSpecifications=[
+                                                            {
+                                                                'LicenseConfigurationArn': LicenseConfigurations['LicenseConfigurationArn']
+                                                            }
+                                                        ]
+                                                    )
+                                                    list_response = lm_client.list_license_specifications_for_resource(
+                                                        ResourceArn=resource_arn,
+                                                    )
+                                                else:
+                                                    print ('Skipping...No matching tags found:', instance['InstanceId'])
+                                    else:
+                                        print('Skipping...Self-managed license does not have any tags')
+                  if "NextToken" in response:
+                      next_token = response['NextToken']
+                      response = ec2_client.describe_instances(
+                          Filters = [
+                              {
+                                  'Name': 'tag-key',
+                                  'Values': [
+                                      ResourceTargetTagKey,
+                                  ]
+                              },
+                          ],
+                          NextToken = next_token
+                      )
+                  else:
+                      break
+              return response
+
+
+          def get_lm_client(Region):
+              return boto3.client('license-manager', Region)
+
+          def get_ec2_client(Region):
+              return boto3.client('ec2', Region)
+
+          def handler(event, context):
+              print("Start of the Self-managed license - UpdateLicenseSpecifications based on tags")
+
+              client = boto3.client("sts")
+              account_id = client.get_caller_identity()["Account"]
+
+              # Updates license specifications for tagged ec2 instances using the sample license configuration and tags
+              update_license_specifications_for_all_ec2_tagged_instances()
+      Environment:
+        Variables:
+          RegionId: !Ref "AWS::Region"
+          AccountId: !Ref "AWS::AccountId"
+          TargetTagKey: !Ref TagKey
+          CentralAWSAccountID: !Ref AWSAccountId
+      Handler: index.handler
+      Role: !GetAtt LicenseManagerTagBasedAWSLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 900
+  RemoveLicenseManagerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: !Sub "Lambda function to remove the EC2 instance from a License Manager configuration based on tags. Created by CloudFormation stack name: ${AWS::StackName}"
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          default_region = os.environ['RegionId']
+          default_account = os.environ['AccountId']
+          ResourceTargetTagKey = os.environ['TargetTagKey']
+          LMAccountID = os.environ['CentralAWSAccountID']
+
+          def get_license_configuration(LicenseConfigurationArn):
+              lm_client = get_lm_client(default_region)
+              response = lm_client.get_license_configuration(
+                  LicenseConfigurationArn = LicenseConfigurationArn,
+              )
+              return response
+
+          # sample function to update license specifications for all ec2 instances based on tags
+          def update_license_specifications_for_all_ec2_tagged_instances():
+              lm_client = get_lm_client(default_region)
+              ec2_client = get_ec2_client(default_region)
+
+              selfmanagedlicenses = lm_client.list_license_configurations()
+              for idx, LicenseConfigurations in enumerate(selfmanagedlicenses['LicenseConfigurations']):
+                  print('Self-managed license ARN:', LicenseConfigurations['LicenseConfigurationArn'])
+                  print('Self-managed license Name:', LicenseConfigurations['Name'])
+                  getlicenseconfig = get_license_configuration(LicenseConfigurations['LicenseConfigurationArn'])
+                  if ('Tags' in getlicenseconfig):
+                      print('Self-managed license tags:', getlicenseconfig['Tags'])
+                      for LCtag in getlicenseconfig['Tags']:
+                          if LCtag['Key'] == ResourceTargetTagKey:
+                              LCrecources = lm_client.list_usage_for_license_configuration(
+                                  LicenseConfigurationArn=LicenseConfigurations['LicenseConfigurationArn'],
+                                  Filters=[
+                                      {
+                                          'Name': 'resourceType',
+                                          'Values': [
+                                              'EC2_INSTANCE',
+                                              'EC2_HOST'
+                                          ]
+                                      },
+                                      {
+                                          'Name': 'resourceAccount',
+                                          'Values': [
+                                              default_account,
+                                          ]
+                                      }
+                                  ]
+                              )
+                              if LCrecources['LicenseConfigurationUsageList']:
+                                  for LCec2instance in LCrecources['LicenseConfigurationUsageList']:
+                                      LCinstanceID = LCec2instance['ResourceArn'].split('/',1)
+                                      CheckInstancetags = ec2_client.describe_tags(
+                                          Filters=[
+                                              {
+                                                  'Name': 'resource-type',
+                                                  'Values': [
+                                                      'instance',
+                                                      'dedicated-host'
+                                                  ]
+                                              },
+                                              {
+                                                  'Name': 'resource-id',
+                                                  'Values': [
+                                                      LCinstanceID[1]
+                                                  ]
+                                              },
+                                              {
+                                                  'Name': 'key',
+                                                  'Values': [
+                                                      LCtag['Key']
+                                                  ]
+                                              },
+                                              {
+                                                  'Name': 'value',
+                                                  'Values': [
+                                                      LCtag['Value']
+                                                  ]
+                                              }
+                                          ]
+                                      )
+                                      if CheckInstancetags['Tags']:
+                                          print ('Skipping...EC2 Instance found with match tags:', LCinstanceID[1])
+                                          continue
+                                      else:
+                                        try:
+                                          print('ResourceARN:',LCec2instance['ResourceArn'])
+                                          print ('Removing...EC2 Instance found with mismatch tags:', LCinstanceID[1])
+                                          lm_client.update_license_specifications_for_resource(
+                                              ResourceArn = LCec2instance['ResourceArn'],
+                                              RemoveLicenseSpecifications=[
+                                                  {
+                                                      'LicenseConfigurationArn': LicenseConfigurations['LicenseConfigurationArn']
+                                                  }
+                                              ]
+                                          )
+                                        except:
+                                          print ('Failed...Could not remove EC2 Instances:', LCinstanceID[1])
+                                          pass
+                              else:
+                                  print('Skipping...Self-managed license does not have any EC2 instances')
+                  else:
+                      print('Skipping...Self-managed license does not have any tags')
+
+          def get_lm_client(Region):
+              return boto3.client('license-manager', Region)
+
+          def get_ec2_client(Region):
+              return boto3.client('ec2', Region)
+
+          def handler(event, context):
+              print("Start of the Self-managed license - UpdateLicenseSpecifications based on tags")
+
+              client = boto3.client("sts")
+              account_id = client.get_caller_identity()["Account"]
+
+              # Updates license specifications for tagged ec2 instances using the sample license configuration and tags
+              update_license_specifications_for_all_ec2_tagged_instances()
+      Environment:
+        Variables:
+          RegionId: !Ref "AWS::Region"
+          AccountId: !Ref "AWS::AccountId"
+          TargetTagKey: !Ref TagKey
+          CentralAWSAccountID: !Ref AWSAccountId
+      Handler: index.handler
+      Role: !GetAtt LicenseManagerTagBasedAWSLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 900
